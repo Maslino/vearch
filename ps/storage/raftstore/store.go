@@ -92,6 +92,32 @@ func CreateStore(ctx context.Context, pID entity.PartitionID, nodeID entity.Node
 	return s, nil
 }
 
+// snapshot after load engine
+func (s *Store) ReBuildEngine() (err error) {
+	log.Debug("begin re build engine")
+	// re create engine
+	s.Engine, err = register.Build(s.Space.Engine.Name, register.EngineConfig{
+		Path:        s.DataPath,
+		Space:       s.Space,
+		PartitionID: s.Partition.Id,
+		DWPTNum:     config.Conf().PS.EngineDWPTNum,
+	})
+	if err != nil {
+		return err
+	}
+	apply, err := s.Engine.Reader().ReadSN(s.Ctx)
+	if err != nil {
+		s.Engine.Close()
+		return err
+	}
+	// sn - 1
+	s.LastFlushSn = apply - 1
+	s.LastFlushTime = time.Now()
+	s.Partition.SetStatus(entity.PA_READONLY)
+
+	return err
+}
+
 // Start start the store.
 func (s *Store) Start() (err error) {
 	// todo: gamma engine load need run after snapshot finish
@@ -218,6 +244,11 @@ func (s *Store) GetUnreachable(id uint64) []uint64 {
 
 func (s *Store) GetPartition() *entity.Partition {
 	return s.Partition
+}
+
+func (s *Store) RemoveDataPath() (err error) {
+	// delete data and raft log
+	return os.RemoveAll(s.DataPath)
 }
 
 func (s *Store) ChangeMember(changeType proto.ConfChangeType, server *entity.Server) error {
