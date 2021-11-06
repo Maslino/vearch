@@ -16,13 +16,19 @@ package document
 
 import (
 	"context"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/vearch/vearch/client"
+	"github.com/vearch/vearch/config"
 	"github.com/vearch/vearch/proto/entity"
 	"github.com/vearch/vearch/proto/vearchpb"
 	"github.com/vearch/vearch/ps/engine/sortorder"
 	"github.com/vearch/vearch/util/log"
 )
+
+const defaultRpcTimeOut int64 = 10 * 1000 // 10 second
 
 type docService struct {
 	client *client.Client
@@ -34,7 +40,23 @@ func newDocService(client *client.Client) *docService {
 	}
 }
 
+func setTimeOut(ctx context.Context, head *vearchpb.RequestHead) (context.Context, context.CancelFunc) {
+	timeout := defaultRpcTimeOut 
+	if config.Conf().Router.RpcTimeOut > 0 {
+		timeout = int64(config.Conf().Router.RpcTimeOut)
+	}
+	if head.TimeOutMs > 0 && head.TimeOutMs < timeout {
+		timeout = head.TimeOutMs
+	}
+	t := time.Duration(timeout) * time.Millisecond
+	endTime := time.Now().Add(t)
+	ctx = context.WithValue(ctx, entity.RPC_TIME_OUT, endTime)
+	return context.WithTimeout(ctx, t)
+}
+
 func (docService *docService) getDocs(ctx context.Context, args *vearchpb.GetRequest) *vearchpb.GetResponse {
+	ctx, cancel := setTimeOut(ctx, args.Head)
+	defer cancel()
 	reply := &vearchpb.GetResponse{Head: newOkHead()}
 	request := client.NewRouterRequest(ctx, docService.client)
 	request.SetMsgID().SetMethod(client.GetDocsHandler).SetHead(args.Head).SetSpace().SetDocsByKey(args.PrimaryKeys).PartitionDocs()
@@ -49,6 +71,8 @@ func (docService *docService) getDocs(ctx context.Context, args *vearchpb.GetReq
 }
 
 func (docService *docService) addDoc(ctx context.Context, args *vearchpb.AddRequest) *vearchpb.AddResponse {
+	ctx, cancel := setTimeOut(ctx, args.Head)
+	defer cancel()
 	reply := &vearchpb.AddResponse{Head: newOkHead()}
 	request := client.NewRouterRequest(ctx, docService.client)
 	docs := make([]*vearchpb.Document, 0)
@@ -71,6 +95,8 @@ func (docService *docService) addDoc(ctx context.Context, args *vearchpb.AddRequ
 }
 
 func (docService *docService) updateDoc(ctx context.Context, args *vearchpb.UpdateRequest) *vearchpb.UpdateResponse {
+	ctx, cancel := setTimeOut(ctx, args.Head)
+	defer cancel()
 	reply := &vearchpb.UpdateResponse{Head: newOkHead()}
 	docs := make([]*vearchpb.Document, 0)
 	docs = append(docs, args.Doc)
@@ -93,6 +119,8 @@ func (docService *docService) updateDoc(ctx context.Context, args *vearchpb.Upda
 }
 
 func (docService *docService) deleteDocs(ctx context.Context, args *vearchpb.DeleteRequest) *vearchpb.DeleteResponse {
+	ctx, cancel := setTimeOut(ctx, args.Head)
+	defer cancel()
 	reply := &vearchpb.DeleteResponse{Head: newOkHead()}
 	request := client.NewRouterRequest(ctx, docService.client)
 	request.SetMsgID().SetMethod(client.DeleteDocsHandler).SetHead(args.Head).SetSpace().SetDocsByKey(args.PrimaryKeys).SetDocsField().PartitionDocs()
@@ -107,6 +135,8 @@ func (docService *docService) deleteDocs(ctx context.Context, args *vearchpb.Del
 }
 
 func (docService *docService) bulk(ctx context.Context, args *vearchpb.BulkRequest) *vearchpb.BulkResponse {
+	ctx, cancel := setTimeOut(ctx, args.Head)
+	defer cancel()
 	reply := &vearchpb.BulkResponse{Head: newOkHead()}
 	request := client.NewRouterRequest(ctx, docService.client)
 	request.SetMsgID().SetMethod(client.BatchHandler).SetHead(args.Head).SetSpace().SetDocs(args.Docs).SetDocsField().PartitionDocs()
@@ -139,6 +169,8 @@ func (this *docService) getSpace(ctx context.Context, dbName string, spaceName s
 }
 
 func (docService *docService) search(ctx context.Context, args *vearchpb.SearchRequest) *vearchpb.SearchResponse {
+	ctx, cancel := setTimeOut(ctx, args.Head)
+	defer cancel()
 	request := client.NewRouterRequest(ctx, docService.client)
 	request.SetMsgID().SetMethod(client.SearchHandler).SetHead(args.Head).SetSpace().SearchByPartitions(args)
 	if request.Err != nil {
@@ -168,14 +200,28 @@ func (docService *docService) search(ctx context.Context, args *vearchpb.SearchR
 
 func (docService *docService) bulkSearch(ctx context.Context, args []*vearchpb.SearchRequest) *vearchpb.SearchResponse {
 	searchResponse := &vearchpb.SearchResponse{}
+	var wg sync.WaitGroup
+	respChain := make(chan *vearchpb.SearchResponse, len(args))
 	for _, arg := range args {
-		res := docService.search(ctx, arg)
+		wg.Add(1)
+		go func(arg *vearchpb.SearchRequest, ctx context.Context) {
+			res := docService.search(ctx, arg)
+			respChain <- res
+			wg.Done()
+		}(arg, ctx)
+	}
+	wg.Wait()
+	close(respChain)
+	for resp := range respChain {
 		if searchResponse == nil {
-			searchResponse = res
+			searchResponse = resp
 		} else {
-			searchResponse.Results = append(searchResponse.Results, res.Results[0])
+			if resp.Results != nil && len(resp.Results) > 0 {
+				searchResponse.Results = append(searchResponse.Results, resp.Results[0])
+			}
 		}
 	}
+
 	return searchResponse
 }
 
@@ -228,21 +274,26 @@ func (docService *docService) forceMerge(ctx context.Context, args *vearchpb.For
 func (docService *docService) deleteByQuery(ctx context.Context, args *vearchpb.SearchRequest) *vearchpb.DelByQueryeResponse {
 
 	request := client.NewRouterRequest(ctx, docService.client)
-	request.SetMsgID().SetMethod(client.DeleteByQueryHandler).SetHead(args.Head).SetSpace().SearchByPartitions(args)
+	deleteByScalar := false
+	idIsLong := false
+	if args.VecFields != nil {
+		request.SetMsgID().SetMethod(client.DeleteByQueryHandler).SetHead(args.Head).SetSpace().SearchByPartitions(args)
+	} else {
+		request.SetMsgID().SetMethod(client.DeleteByQueryFilterHandler).SetHead(args.Head).SetSpace().SearchByPartitions(args)
+		deleteByScalar = true
+	}
 	if request.Err != nil {
 		return &vearchpb.DelByQueryeResponse{Head: setErrHead(request.Err)}
 	}
 
-	delByQueryResponse := request.DelByQueryeExecute()
+	if strings.Compare(args.Head.Params["idIsLong"], "true") == 0 {
+		idIsLong = true
+	}
+
+	delByQueryResponse := request.DelByQueryeExecute(deleteByScalar, idIsLong)
 
 	if delByQueryResponse == nil {
 		return &vearchpb.DelByQueryeResponse{Head: setErrHead(request.Err)}
-	}
-	if delByQueryResponse.Head == nil {
-		delByQueryResponse.Head = newOkHead()
-	}
-	if delByQueryResponse.Head.Err == nil {
-		delByQueryResponse.Head.Err = newOkHead().Err
 	}
 
 	return delByQueryResponse

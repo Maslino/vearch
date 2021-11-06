@@ -21,6 +21,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cast"
@@ -33,10 +34,10 @@ import (
 	"github.com/vearch/vearch/util/log"
 )
 
-func docGetResponse(client *client.Client, args *vearchpb.GetRequest, reply *vearchpb.GetResponse, returnFieldsMap map[string]string) ([]byte, error) {
+func docGetResponse(client *client.Client, args *vearchpb.GetRequest, reply *vearchpb.GetResponse, returnFieldsMap map[string]string, isBatch bool) ([]byte, error) {
 	var builder = cbjson.ContentBuilderFactory()
 	isArray := false
-	if reply != nil && reply.Items != nil && len(reply.Items) > 1 {
+	if isBatch || (reply != nil && reply.Items != nil && len(reply.Items) > 1) {
 		builder.BeginArray()
 		isArray = true
 	}
@@ -81,6 +82,11 @@ func docGetResponse(client *client.Client, args *vearchpb.GetRequest, reply *vea
 			builder.ValueInterface(source)
 		} else {
 			builder.ValueBool(false)
+		}
+		if item.Err != nil{
+			builder.More()
+			builder.Field("msg")
+			builder.ValueString(item.Err.Msg)
 		}
 		builder.EndObject()
 	}
@@ -366,14 +372,14 @@ func DocToContent(dh []*vearchpb.ResultItem, head *vearchpb.RequestHead, space *
 			builder.Field("_score")
 			builder.ValueFloat(float64(u.Score))
 
-			if u.Extra != "" && len(u.Extra) > 0 {
+			/*if u.Extra != "" && len(u.Extra) > 0 {
 				builder.More()
 				var extra map[string]interface{}
 				if err := json.Unmarshal([]byte(u.Extra), &extra); err == nil {
 					builder.Field("_extra")
 					builder.ValueInterface(extra)
 				}
-			}
+			}*/
 			if u.Source != nil {
 				var sourceJson json.RawMessage
 				if err := json.Unmarshal(u.Source, &sourceJson); err != nil {
@@ -405,17 +411,52 @@ func ToContents(srs []*vearchpb.SearchResult, head *vearchpb.RequestHead, took t
 	builder.Field("results")
 
 	builder.BeginArray()
-	for i, sr := range srs {
-		if bytes, err := ToContent(sr, head, took, space); err != nil {
-			return nil, err
-		} else {
-			builder.ValueRaw(string(bytes))
+
+	if srs != nil && len(srs) > 1 {
+		var wg sync.WaitGroup
+		respChain := make(chan map[int][]byte, len(srs))
+		for i, sr := range srs {
+			wg.Add(1)
+			go func(sr *vearchpb.SearchResult, head *vearchpb.RequestHead, took time.Duration, space *entity.Space, index int) {
+				bytes, err := ToContent(sr, head, took, space)
+				if err == nil {
+					respMap := make(map[int][]byte)
+					respMap[index] = bytes
+					respChain <- respMap
+				}
+				wg.Done()
+			}(sr, head, took, space, i)
+		}
+		wg.Wait()
+		close(respChain)
+
+		byteArr := make([][]byte, len(srs))
+		for resp := range respChain {
+			for index, value := range resp {
+				byteArr[index] = value
+			}
 		}
 
-		if i+1 < len(srs) {
-			builder.More()
+		for i := 0; i < len(srs); i++ {
+			builder.ValueRaw(string(byteArr[i]))
+			if i+1 < len(srs) {
+				builder.More()
+			}
+		}
+	} else {
+		for i, sr := range srs {
+			if bytes, err := ToContent(sr, head, took, space); err != nil {
+				return nil, err
+			} else {
+				builder.ValueRaw(string(bytes))
+			}
+
+			if i+1 < len(srs) {
+				builder.More()
+			}
 		}
 	}
+
 	builder.EndArray()
 
 	builder.EndObject()
@@ -541,7 +582,7 @@ func GetVectorFieldValue(doc *vearchpb.Document, space *entity.Space) (floatFeat
 
 			} else {
 				float32s, s, err := cbbytes.ByteToVector(fv.Value)
-				log.Error("vector.Field.value len %d, source is [%s]", len(fv.Value), s)
+				//log.Error("vector.Field.value len %d, source is [%s]", len(fv.Value), s)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -657,6 +698,56 @@ func SearchNullToContent(searchStatus vearchpb.SearchStatus, took time.Duration)
 	builder.Field("max_score")
 	builder.ValueFloat(-1)
 
+	builder.EndObject()
+
+	builder.EndObject()
+
+	return builder.Output()
+
+}
+
+func deleteByQueryResult(resp *vearchpb.DelByQueryeResponse) ([]byte, error) {
+	var builder = cbjson.ContentBuilderFactory()
+
+	builder.BeginObject()
+
+	builder.Field("code")
+	if resp.Head == nil || resp.Head.Err == nil {
+		builder.ValueNumeric(0)
+	} else {
+		builder.ValueNumeric(1)
+		if resp.Head != nil && resp.Head.Err != nil {
+			builder.More()
+			builder.Field("msg")
+			builder.ValueString(resp.Head.Err.Msg)
+		}
+	}
+
+	builder.More()
+
+	builder.Field("del_num")
+	builder.ValueNumeric(int64(resp.DelNum))
+
+	builder.More()
+	builder.Field("_id")
+	if resp.IdsStr != nil {
+		builder.ValueInterface(resp.IdsStr)
+	} else if resp.IdsLong != nil {
+		builder.ValueInterface(resp.IdsLong)
+	} else {
+		builder.ValueString("[]")
+	}
+
+	builder.EndObject()
+
+	return builder.Output()
+}
+
+func docPrintLogSwitchResponse(printLogSwitch bool) ([]byte, error) {
+	var builder = cbjson.ContentBuilderFactory()
+	builder.BeginObject()
+	builder.Field("print_log_switch")
+	builder.ValueBool(printLogSwitch)
 	builder.EndObject()
 
 	return builder.Output()

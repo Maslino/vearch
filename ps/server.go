@@ -17,10 +17,11 @@ package ps
 import (
 	"context"
 	"fmt"
-	"github.com/vearch/vearch/util/errutil"
 	"math"
 	"sync"
 	"time"
+
+	"github.com/vearch/vearch/util/errutil"
 
 	"github.com/vearch/vearch/util/metrics/mserver"
 
@@ -44,6 +45,11 @@ import (
 
 const maxTryTime = 5
 
+var (
+	defaultConcurrentNum = 32
+	defaultRpcTimeOut    = 10 // 10 second
+)
+
 // Server partition server
 type Server struct {
 	mu              sync.RWMutex
@@ -60,6 +66,9 @@ type Server struct {
 	wg              sync.WaitGroup
 	changeLeaderC   chan *changeLeaderEntry
 	replicasStatusC chan *raftstore.ReplicasStatusEntry
+	concurrent      chan bool
+	concurrentNum   int
+	rpcTimeOut      int
 }
 
 // NewServer create server instance
@@ -77,7 +86,16 @@ func NewServer(ctx context.Context) *Server {
 		changeLeaderC:   changeLeaderC,
 		replicasStatusC: replicasStatusC,
 	}
+	s.concurrentNum = defaultConcurrentNum
+	if config.Conf().PS.ConcurrentNum > 0 {
+		s.concurrentNum = config.Conf().PS.ConcurrentNum
+	}
+	s.concurrent = make(chan bool, s.concurrentNum)
 
+	s.rpcTimeOut = defaultRpcTimeOut
+	if config.Conf().PS.RpcTimeOut > 0 {
+		s.rpcTimeOut = config.Conf().PS.RpcTimeOut
+	}
 	s.ctx, s.ctxCancel = context.WithCancel(ctx)
 
 	s.rpcServer = rpc.NewRpcServer(config.LocalCastAddr, config.Conf().PS.RpcPort) // any port ???
@@ -89,8 +107,6 @@ type changeLeaderEntry struct {
 	leader entity.NodeID
 	pid    entity.PartitionID
 }
-
-
 
 // Start start server
 func (s *Server) Start() error {
@@ -187,7 +203,7 @@ func (s *Server) startChangeLeaderC() {
 				log.Info("startChangeLeaderC() receive an change leader event, nodeId: %d, partitionId: %d", entry.leader, entry.pid)
 				s.registerMaster(entry.leader, entry.pid)
 			case pStatus := <-s.replicasStatusC:
-				log.Info("receive an change leader status, nodeId: %d, partitionId: %d",pStatus.NodeID, pStatus.PartitionID)
+				log.Info("receive an change leader status, nodeId: %d, partitionId: %d", pStatus.NodeID, pStatus.PartitionID)
 				s.changeReplicas(pStatus)
 			}
 		}
@@ -229,7 +245,7 @@ func (s *Server) getRouterIPS(ctx context.Context) (routerIPS []string) {
 			panic(fmt.Errorf("query router ip error"))
 		}
 		if routerIPS != nil && len(routerIPS) > 0 {
-			for  _, IP := range routerIPS {
+			for _, IP := range routerIPS {
 				config.Conf().Router.RouterIPS = append(config.Conf().Router.RouterIPS, IP)
 			}
 			log.Info("get router info [%v]", routerIPS)

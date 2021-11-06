@@ -62,6 +62,9 @@ func DeleteDoc(engine unsafe.Pointer, docID []byte) int {
 }
 
 func GetEngineStatus(engine unsafe.Pointer, status *EngineStatus) {
+	if engine == nil || status == nil {
+		return
+	}
 	var CBuffer *C.char
 	zero := 0
 	length := &zero
@@ -137,6 +140,20 @@ func DelDocByQuery(engine unsafe.Pointer, request *Request) int {
 	return ret
 }
 
+func DelDocByFilter(engine unsafe.Pointer, reqByte []byte) (int, []byte) {
+	var CBuffer *C.char
+	zero := 0
+	length := &zero
+
+	ret := int(C.DelDocByFilter(engine,
+		(*C.char)(unsafe.Pointer(&reqByte[0])), C.int(len(reqByte)),
+		(**C.char)(unsafe.Pointer(&CBuffer)),
+		(*C.int)(unsafe.Pointer(length))))
+	defer C.free(unsafe.Pointer(CBuffer))
+	respByte := C.GoBytes(unsafe.Pointer(CBuffer), C.int(*length))
+	return ret, respByte
+}
+
 func SetEngineCfg(engine unsafe.Pointer, config *Config) int {
 	var buffer []byte
 	config.Serialize(&buffer)
@@ -153,4 +170,3 @@ func GetEngineCfg(engine unsafe.Pointer, config *Config) {
 	buffer := C.GoBytes(unsafe.Pointer(CBuffer), C.int(*length))
 	config.DeSerialize(buffer)
 }
-

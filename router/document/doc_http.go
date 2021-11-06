@@ -18,18 +18,20 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/vearch/vearch/proto/entity"
-
+	"github.com/opentracing/opentracing-go"
 	"github.com/vearch/vearch/client"
 	"github.com/vearch/vearch/config"
 	"github.com/vearch/vearch/monitor"
+	"github.com/vearch/vearch/proto/entity"
 	"github.com/vearch/vearch/proto/vearchpb"
 	"github.com/vearch/vearch/router/document/resp"
 	"github.com/vearch/vearch/util/log"
 	"github.com/vearch/vearch/util/netutil"
+	"github.com/vearch/vearch/util/uuid"
 )
 
 const (
@@ -113,6 +115,9 @@ func (handler *DocumentHandler) ExportToServer() error {
 	// bulk: /$dbName/$spaceName/_query_byids
 	handler.httpServer.HandlesMethods([]string{http.MethodPost}, fmt.Sprintf("/{%s}/{%s}/_query_byids", URLParamDbName, URLParamSpaceName), []netutil.HandleContinued{handler.handleTimeout, handler.handleAuth, handler.handlerQueryDocByIds}, nil)
 
+	// bulk: /$dbName/$spaceName/_query_by_ids
+	handler.httpServer.HandlesMethods([]string{http.MethodPost}, fmt.Sprintf("/{%s}/{%s}/_query_by_ids", URLParamDbName, URLParamSpaceName), []netutil.HandleContinued{handler.handleTimeout, handler.handleAuth, handler.handlerQueryDocByIds}, nil)
+
 	// bulk: /$dbName/$spaceName/_query_byids_feture
 	handler.httpServer.HandlesMethods([]string{http.MethodPost}, fmt.Sprintf("/{%s}/{%s}/_query_byids_feature", URLParamDbName, URLParamSpaceName), []netutil.HandleContinued{handler.handleTimeout, handler.handleAuth, handler.handlerQueryDocByIdsFeature}, nil)
 
@@ -124,6 +129,9 @@ func (handler *DocumentHandler) ExportToServer() error {
 
 	// forcemerge space: /$dbName/$spaceName/_forcemerge
 	handler.httpServer.HandlesMethods([]string{http.MethodPost}, fmt.Sprintf("/{%s}/{%s}/_forcemerge", URLParamDbName, URLParamSpaceName), []netutil.HandleContinued{handler.handleTimeout, handler.handleAuth, handler.handleForceMerge}, nil)
+
+	// update doc: /$dbName/$spaceName/_log_collect
+	handler.httpServer.HandlesMethods([]string{http.MethodPost, http.MethodPut}, fmt.Sprintf("/{%s}/{%s}/_log_print_switch", URLParamDbName, URLParamSpaceName), []netutil.HandleContinued{handler.handleTimeout, handler.handleAuth, handler.handleLogPrintSwitch}, nil)
 
 	// get doc: /$dbName/$spaceName/$docId
 	handler.httpServer.HandlesMethods([]string{http.MethodGet}, fmt.Sprintf("/{%s}/{%s}/{%s}", URLParamDbName, URLParamSpaceName, URLParamID), []netutil.HandleContinued{handler.handleTimeout, handler.handleAuth, handler.handleGetDoc}, nil)
@@ -143,6 +151,8 @@ func (handler *DocumentHandler) ExportToServer() error {
 }
 
 func (handler *DocumentHandler) handleTimeout(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
+	messageID := uuid.FlakeUUID()
+	ctx = context.WithValue(ctx, entity.MessageID, messageID)
 	return ctx, true
 }
 
@@ -189,12 +199,15 @@ func (handler *DocumentHandler) cacheInfo(ctx context.Context, w http.ResponseWr
 
 func (handler *DocumentHandler) handleGetDoc(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handleGetDoc", startTime)
+	operateName := "handleGetDoc"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.GetRequest{}
 	args.Head = setRequestHead(params, r)
 	args.PrimaryKeys = strings.Split(params.ByName(URLParamID), ",")
 	reply := handler.docService.getDocs(ctx, args)
-	if resultBytes, err := docGetResponse(handler.client, args, reply, nil); err != nil {
+	if resultBytes, err := docGetResponse(handler.client, args, reply, nil, false); err != nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
 		return ctx, true
 	} else {
@@ -243,8 +256,11 @@ func (handler *DocumentHandler) handleUpdateDoc(ctx context.Context, w http.Resp
 
 // handleBulk For add documents by batch
 func (handler *DocumentHandler) handleBulk(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
-	t1 := time.Now()
-	defer monitor.Profiler("handleBulk", t1)
+	startTime := time.Now()
+	operateName := "handleBulk"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.BulkRequest{}
 	args.Head = setRequestHead(params, r)
 	space, err := handler.client.Space(ctx, args.Head.DbName, args.Head.SpaceName)
@@ -302,9 +318,16 @@ func (handler *DocumentHandler) handleFlush(ctx context.Context, w http.Response
 // handleSearchDoc for search by param
 func (handler *DocumentHandler) handleSearchDoc(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handleSearchDoc", startTime)
+	operateName := "handleSearchDoc"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.SearchRequest{}
 	args.Head = setRequestHead(params, r)
+	if args.Head.Params == nil {
+		params := make(map[string]string)
+		args.Head.Params = params
+	}
 	space, err := handler.docService.getSpace(ctx, args.Head.DbName, args.Head.SpaceName)
 	if space == nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "dbName or spaceName param not build db or space")
@@ -345,9 +368,16 @@ func (handler *DocumentHandler) handleSearchDoc(ctx context.Context, w http.Resp
 // handleMSearchDoc for search by param
 func (handler *DocumentHandler) handleMSearchDoc(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handleMSearchDoc", startTime)
+	operateName := "handleMSearchDoc"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.SearchRequest{}
 	args.Head = setRequestHead(params, r)
+	if args.Head.Params == nil {
+		params := make(map[string]string)
+		args.Head.Params = params
+	}
 	space, err := handler.docService.getSpace(ctx, args.Head.DbName, args.Head.SpaceName)
 	if space == nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "dbName or spaceName param not build db or space")
@@ -357,39 +387,110 @@ func (handler *DocumentHandler) handleMSearchDoc(ctx context.Context, w http.Res
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "query Cache space null")
 		return ctx, false
 	}
+	paramStart := time.Now()
 	err = docSearchParse(r, space, args)
 	if err != nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
 		return ctx, false
 	}
-
 	serviceStart := time.Now()
 	searchRes := handler.docService.search(ctx, args)
-	serviceEnd := time.Now()
-	serviceCost := serviceEnd.Sub(serviceStart)
-
+	serviceCost := time.Now().Sub(serviceStart)
+	contentStartTime := time.Now()
+	log.Info("handleMSearchDoc service cost:[%f]", serviceCost.Seconds()*1000)
 	bs, err := ToContents(searchRes.Results, args.Head, serviceCost, space)
 	if err != nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
 		return ctx, true
 	}
-	resp.SendJsonBytes(ctx, w, bs)
 	endTime := time.Now()
+	resp.SendJsonBytes(ctx, w, bs)
 	log.Debug("msearch total use :[%f] service use :[%f]",
 		(endTime.Sub(startTime).Seconds())*1000, serviceCost.Seconds()*1000)
+
+	if config.LogInfoPrintSwitch {
+		serializeCostTime := searchRes.Head.Params["serializeCostTime"]
+		reqBodyCostTime := args.Head.Params["reqBodyCostTime"]
+		gammaCostTime := searchRes.Head.Params["gammaCostTime"]
+		mergeCostTime := searchRes.Head.Params["mergeCostTime"]
+		pidCacheTime := searchRes.Head.Params["pidCacheTime"]
+		nodeIdTime := searchRes.Head.Params["nodeIdTime"]
+		rpcClientTime := searchRes.Head.Params["rpcClientTime"]
+		rpcCostTime := searchRes.Head.Params["rpcCostTime"]
+		deSerializeCostTime := searchRes.Head.Params["deSerializeCostTime"]
+		fieldParsingTime := searchRes.Head.Params["fieldParsingTime"]
+		sortCostTime := searchRes.Head.Params["sortCostTime"]
+		normalCostTime := searchRes.Head.Params["normalCostTime"]
+		partitionCostTime := searchRes.Head.Params["partitionCostTime"]
+		executeCostTime := searchRes.Head.Params["executeCostTime"]
+		normalTime := searchRes.Head.Params["normalTime"]
+		rpcBeforeTime := searchRes.Head.Params["rpcBeforeTime"]
+		rpcTotalTime := searchRes.Head.Params["rpcTotalTime"]
+
+		msg := fmt.Sprintf("getspace [%f]ms "+
+			"search param [%f]ms "+
+			"reqbody [%s]ms "+
+			"pidCache [%s]ms "+
+			"nodeId [%s]ms "+
+			"rpcClient [%s]ms "+
+			"normal [%s]ms "+
+			"rpcBefore [%s]ms "+
+			"serialize [%s]ms "+
+			"gamma [%s]ms "+
+			"rpc [%s]ms "+
+			"deSerialize [%s]ms "+
+			"sort [%s]ms "+
+			"fieldparsing [%s]ms "+
+			"merge [%s]ms, "+
+			"normal [%s]ms "+
+			"rpcTotal [%s]ms "+
+			"partition [%s]ms "+
+			"execute [%s]ms "+
+			"service [%f]ms "+
+			"respv [%f]ms "+
+			"total [%f]ms ",
+			(paramStart.Sub(startTime).Seconds())*1000,
+			(serviceStart.Sub(paramStart).Seconds())*1000,
+			reqBodyCostTime,
+			pidCacheTime,
+			nodeIdTime,
+			rpcClientTime,
+			normalTime,
+			rpcBeforeTime,
+			serializeCostTime,
+			gammaCostTime,
+			rpcCostTime,
+			deSerializeCostTime,
+			sortCostTime,
+			fieldParsingTime,
+			mergeCostTime,
+			normalCostTime,
+			rpcTotalTime,
+			partitionCostTime,
+			executeCostTime, serviceCost.Seconds()*1000,
+			(endTime.Sub(contentStartTime).Seconds())*1000,
+			(endTime.Sub(startTime).Seconds())*1000)
+		log.Info(msg)
+	}
 	return ctx, true
 }
 
 // handleMSearchIdsDoc for search by param
 func (handler *DocumentHandler) handleMSearchIdsDoc(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handleMSearchIdsDoc", startTime)
+	operateName := "handleMSearchIdsDoc"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.SearchRequest{}
 	args.Head = setRequestHead(params, r)
 	if args.Head.Params != nil {
 		paramMap := args.Head.Params
 		paramMap["queryOnlyId"] = "true"
 		args.Head.Params = paramMap
+	} else {
+		params := make(map[string]string)
+		args.Head.Params = params
 	}
 	space, err := handler.docService.getSpace(ctx, args.Head.DbName, args.Head.SpaceName)
 	if space == nil {
@@ -423,31 +524,34 @@ func (handler *DocumentHandler) handleMSearchIdsDoc(ctx context.Context, w http.
 	return ctx, true
 }
 
-// getUrlQuery get param in uri by name
-func getUrlQuery(r *http.Request, name string) (value string) {
-	reqArgs := netutil.GetUrlQuery(r)
-	if value, ok := reqArgs[name]; ok {
-		return value
-	}
-	return
-}
-
 // setRequestHead set head of request
 func setRequestHead(params netutil.UriParams, r *http.Request) (head *vearchpb.RequestHead) {
 	head = &vearchpb.RequestHead{}
 	head.DbName = params.ByName(URLParamDbName)
 	head.SpaceName = params.ByName(URLParamSpaceName)
 	head.Params = netutil.GetUrlQuery(r)
+	if timeout, ok := head.Params["timeout"]; ok {
+		var err error
+		if head.TimeOutMs, err = strconv.ParseInt(timeout, 10, 64); err != nil {
+			log.Warnf("timeout[%s] param parse to int failed, err: %s", timeout, err.Error())
+		}
+	}
 	return
 }
 
 // handlerQueryDocByIds query byids
 func (handler *DocumentHandler) handlerQueryDocByIds(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handlerQueryDocByIds", startTime)
+	operateName := "handlerQueryDocByIds"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.GetRequest{}
 	args.Head = setRequestHead(params, r)
-
+	if args.Head.Params == nil {
+		params := make(map[string]string)
+		args.Head.Params = params
+	}
 	space, err := handler.docService.getSpace(ctx, args.Head.DbName, args.Head.SpaceName)
 	if space == nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "dbName or spaceName param not build db or space")
@@ -469,7 +573,7 @@ func (handler *DocumentHandler) handlerQueryDocByIds(ctx context.Context, w http
 	if fieldsParam != nil {
 		queryFieldsParam = arrayToMap(fieldsParam)
 	}
-	if resultBytes, err := docGetResponse(handler.client, args, reply, queryFieldsParam); err != nil {
+	if resultBytes, err := docGetResponse(handler.client, args, reply, queryFieldsParam, true); err != nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
 		return ctx, true
 	} else {
@@ -481,10 +585,16 @@ func (handler *DocumentHandler) handlerQueryDocByIds(ctx context.Context, w http
 // handlerQueryDocByIdsFeature query by ids and feature
 func (handler *DocumentHandler) handlerQueryDocByIdsFeature(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handlerQueryDocByIdsFeature", startTime)
+	operateName := "handlerQueryDocByIdsFeature"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.GetRequest{}
 	args.Head = setRequestHead(params, r)
-
+	if args.Head.Params == nil {
+		params := make(map[string]string)
+		args.Head.Params = params
+	}
 	space, err := handler.docService.getSpace(ctx, args.Head.DbName, args.Head.SpaceName)
 	if space == nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "dbName or spaceName param not build db or space")
@@ -503,7 +613,7 @@ func (handler *DocumentHandler) handlerQueryDocByIdsFeature(ctx context.Context,
 	getDocStart := time.Now()
 	reply := handler.docService.getDocs(ctx, args)
 	getDocEnd := time.Now()
-	if reply.Items == nil || len(reply.Items) == 0 {
+	if reply == nil || reply.Items == nil || len(reply.Items) == 0 {
 		result, err := queryDocByIdsNoResult(getDocEnd.Sub(getDocStart))
 		if err != nil {
 			resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
@@ -515,7 +625,10 @@ func (handler *DocumentHandler) handlerQueryDocByIdsFeature(ctx context.Context,
 
 	searchArgs := &vearchpb.SearchRequest{}
 	searchArgs.Head = setRequestHead(params, r)
-
+	if searchArgs.Head.Params == nil {
+		params := make(map[string]string)
+		searchArgs.Head.Params = params
+	}
 	err = docSearchByFeaturesParse(space, reqBody, searchArgs, reply.Items)
 	if err != nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
@@ -542,10 +655,16 @@ func (handler *DocumentHandler) handlerQueryDocByIdsFeature(ctx context.Context,
 // handleBulkSearchDoc query byids
 func (handler *DocumentHandler) handleBulkSearchDoc(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
 	startTime := time.Now()
-	defer monitor.Profiler("handleBulkSearchDoc", startTime)
+	operateName := "handleBulkSearchDoc"
+	defer monitor.Profiler(operateName, startTime)
+	span, ctx := opentracing.StartSpanFromContext(ctx, operateName)
+	defer span.Finish()
 	args := &vearchpb.SearchRequest{}
 	args.Head = setRequestHead(params, r)
-
+	if args.Head.Params == nil {
+		params := make(map[string]string)
+		args.Head.Params = params
+	}
 	space, err := handler.docService.getSpace(ctx, args.Head.DbName, args.Head.SpaceName)
 	if space == nil {
 		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "dbName or spaceName param not build db or space")
@@ -647,13 +766,44 @@ func (handler *DocumentHandler) handleDeleteByQuery(ctx context.Context, w http.
 		return ctx, false
 	}
 
+	if args.VecFields == nil && args.TermFilters == nil && args.RangeFilters == nil {
+		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", "vector is null or other query is null")
+		return ctx, false
+	}
 	serviceStart := time.Now()
 	delByQueryResp := handler.docService.deleteByQuery(ctx, args)
 	serviceEnd := time.Now()
 	serviceCost := serviceEnd.Sub(serviceStart)
 
 	log.Debug("handleDeleteByQuery cost :%f", serviceCost)
+	shardsBytes, err := deleteByQueryResult(delByQueryResp)
+	if err != nil {
+		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
+		return ctx, true
+	}
 
-	resp.SendJson(ctx, w, delByQueryResp)
+	resp.SendJsonBytes(ctx, w, shardsBytes)
 	return ctx, true
+}
+
+// handleLogPrintSwitch log print switch
+func (handler *DocumentHandler) handleLogPrintSwitch(ctx context.Context, w http.ResponseWriter, r *http.Request, params netutil.UriParams) (context.Context, bool) {
+	startTime := time.Now()
+	defer monitor.Profiler("handleLogPrintSwitch", startTime)
+	args := &vearchpb.GetRequest{}
+	args.Head = setRequestHead(params, r)
+	printSwitch, err := doLogPrintSwitchParse(r)
+	if err != nil {
+		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
+		return ctx, false
+	}
+
+	config.LogInfoPrintSwitch = printSwitch
+	if resultBytes, err := docPrintLogSwitchResponse(config.LogInfoPrintSwitch); err != nil {
+		resp.SendErrorRootCause(ctx, w, http.StatusBadRequest, "", err.Error())
+		return ctx, true
+	} else {
+		resp.SendJsonBytes(ctx, w, resultBytes)
+		return ctx, true
+	}
 }
